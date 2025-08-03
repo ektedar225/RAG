@@ -7,3 +7,4 @@ langchain-google-genai
 PyPDF2
 requests
 faiss-cpu
+pypdf
