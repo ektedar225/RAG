@@ -1,161 +1,115 @@
-# from fastapi import FastAPI, Request, Header, HTTPException
-# from pydantic import BaseModel
-# from typing import List
-# import os
-# import requests
-# from dotenv import load_dotenv
-
-# from my_module import load_documents, split_documents, build_qa_chain
-# from langchain_community.vectorstores import FAISS
-# from langchain.embeddings import OpenAIEmbeddings
-
-# # Load environment variables (e.g., OpenAI API key)
-# load_dotenv()
-
-# app = FastAPI()
-
-# # Define the request body model
-# class HackRxRequest(BaseModel):
-#     documents: str  # URL to a PDF
-#     questions: List[str]
-
-# @app.post("/hackrx/run")
-# async def run_hackrx(request: HackRxRequest, authorization: str = Header(...)):
-#     # Validate Authorization header
-#     if not authorization.startswith("Bearer "):
-#         raise HTTPException(status_code=401, detail="Invalid Authorization header")
-
-#     # Step 1: Download PDF
-#     os.makedirs("SampleDocs", exist_ok=True)
-#     pdf_path = os.path.join("SampleDocs", "input.pdf")
-#     try:
-#         response = requests.get(request.documents)
-#         with open(pdf_path, "wb") as f:
-#             f.write(response.content)
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
-
-#     # Step 2: Process documents and build vectorstore
-#     try:
-#         docs = load_documents("SampleDocs/")
-#         chunks = split_documents(docs)
-#         embeddings = OpenAIEmbeddings()
-#         vectorstore = FAISS.from_documents(chunks, embeddings)
-#         qa_chain = build_qa_chain(vectorstore)
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-
-#     # Step 3: Answer the questions
-#     try:
-#         answers = []
-#         for q in request.questions:
-#             result = qa_chain({"query": q})
-#             answers.append(result["result"])
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Question answering failed: {str(e)}")
-
-#     return {"answers": answers}
-
-
-# main.py
-from fastapi import FastAPI, Request, Header, HTTPException, status
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from typing import List
 import os
-import requests
-import shutil  # For safely removing directories
+import httpx
 from dotenv import load_dotenv
+import hashlib
+import asyncio
 
-# Import functions from your local module
-from my_module import load_documents, split_documents, build_qa_chain, get_gemini_embeddings
-from langchain_community.vectorstores import FAISS
+# Import the new functions from my_module
+from my_module import (
+    load_documents,
+    split_documents,
+    build_vectorstore,
+    get_existing_vectorstore,
+    check_if_namespace_exists,
+    build_qa_chain,
+    search_pinecone_memory, # <-- Updated
+    save_to_pinecone_memory,   # <-- Updated
+    create_pinecone_index_if_not_exists
+)
+from langchain_openai import OpenAIEmbeddings
 
-# Load environment variables (e.g., GOOGLE_API_KEY)
+# Load environment variables
 load_dotenv()
 
-app = FastAPI(
-    title="HackRx Document Q&A API",
-    description="API for processing PDF documents and answering questions using Gemini LLM."
-)
+# Create the Pinecone index if it doesn't exist
+create_pinecone_index_if_not_exists()
 
-# Define the request body model for the API endpoint
+
+app = FastAPI()
+
+embeddings = OpenAIEmbeddings()
+
 class HackRxRequest(BaseModel):
-    documents: str  # URL to a PDF file
-    questions: List[str]  # List of questions to ask about the document
+    documents: str
+    questions: List[str]
 
-@app.post("/hackrx/run", status_code=status.HTTP_200_OK)
+@app.post("/hackrx/run")
 async def run_hackrx(request: HackRxRequest, authorization: str = Header(...)):
-    """
-    Processes a PDF document from a URL and answers a list of questions using Gemini LLM.
-    """
+
     if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Authorization header. Expected 'Bearer <token>'.")
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    
+    print(f"Received request payload: {request.dict()}")
 
-    # Optional: Token check against .env
-    # EXPECTED_API_TOKEN = os.getenv("API_TOKEN")
-    # if authorization.split(" ")[1] != EXPECTED_API_TOKEN:
-    #     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized token.")
+    # Namespace for document chunks
+    doc_namespace = hashlib.sha256(request.documents.encode()).hexdigest()
+    # Separate namespace for Q&A cache
+    qa_namespace = f"{doc_namespace}-qa"
 
-    temp_dir = "SampleDocs_temp"
-    pdf_path = os.path.join(temp_dir, "input.pdf")
+
+    # Check if the document is already processed and stored
+    if await run_in_threadpool(check_if_namespace_exists, doc_namespace):
+        vectorstore = await run_in_threadpool(get_existing_vectorstore, doc_namespace, embeddings)
+    else:
+        # If not cached, download and process the PDF
+        os.makedirs("SampleDocs", exist_ok=True)
+        pdf_path = os.path.join("SampleDocs", f"{doc_namespace}.pdf")
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(request.documents)
+                response.raise_for_status()
+            with open(pdf_path, "wb") as f:
+                f.write(response.content)
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"An unexpected error occurred during PDF download: {str(e)}")
+
+        try:
+            docs = await run_in_threadpool(load_documents, "SampleDocs/")
+            chunks = await run_in_threadpool(split_documents, docs, embeddings)
+            vectorstore = await run_in_threadpool(build_vectorstore, chunks, embeddings, namespace=doc_namespace)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
 
     try:
-        os.makedirs(temp_dir, exist_ok=True)
-        print(f"Attempting to download PDF from: {request.documents}")
-        response = requests.get(request.documents, stream=True)
-        response.raise_for_status()
-
-        with open(pdf_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"PDF downloaded successfully to: {pdf_path}")
-
-        print("Loading and processing documents...")
-        docs = load_documents(temp_dir)
-        if not docs:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No documents found or loaded from the PDF.")
-
-        chunks = split_documents(docs)
-        if not chunks:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No text chunks could be extracted from the PDF.")
-
-        embeddings = get_gemini_embeddings()
-        print("Generating embeddings and building FAISS vectorstore...")
-        vectorstore = FAISS.from_documents(chunks, embeddings)
-        print("FAISS vectorstore built.")
-
-        qa_chain = build_qa_chain(vectorstore)
-        print("QA chain built.")
-
-        print("Answering questions...")
+        qa_chain = await run_in_threadpool(build_qa_chain, vectorstore, namespace=doc_namespace)
         answers = []
-        for i, q in enumerate(request.questions):
-            print(f"  Answering question {i+1}: '{q}'")
+
+        for q in request.questions:
             try:
-                result = qa_chain({"query": q})
-                answers.append(result.get("result", "I don't know."))
-                print(f"  Answer {i+1}: {result.get('result', 'N/A')}")
-            except Exception as qa_e:
-                print(f"Error answering question '{q}': {qa_e}")
-                answers.append(f"Error answering this question: {qa_e}")
-        print("All questions answered.")
+                async def answer_question():
+                    # 1. Try to retrieve answer from Pinecone memory
+                    cached_answer = await run_in_threadpool(search_pinecone_memory, qa_namespace, q, embeddings)
+                    if cached_answer:
+                        return cached_answer
 
-        return {"answers": answers}
+                    # 2. Else, run the full RAG pipeline
+                    response = qa_chain({"query": q})
+                    answer = response["result"]
 
-    except requests.exceptions.RequestException as req_e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to download PDF from URL: {req_e}")
+                    # 3. Save new Q-A to Pinecone memory
+                    await run_in_threadpool(save_to_pinecone_memory, qa_namespace, q, answer, embeddings)
+                    
+                    return answer
+
+                answer = await asyncio.wait_for(answer_question(), timeout=55.0)
+                answers.append(answer)
+
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=408, detail=f"Processing question timed out: {q}")
+
+
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Processing failed: {str(e)}")
-    finally:
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-                print(f"Cleaned up temporary directory: {temp_dir}")
-            except Exception as cleanup_e:
-                print(f"Error cleaning up temporary directory {temp_dir}: {cleanup_e}")
+        raise HTTPException(status_code=500, detail=f"Question answering failed: {str(e)}")
+    
+    #await asyncio.sleep(10)
 
-# === Run the FastAPI server when executed directly ===
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    return {
+        "answers": answers
+    }
